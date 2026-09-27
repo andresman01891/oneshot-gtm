@@ -74,6 +74,17 @@ let eventDetails: EventDetailsFixture | null = null;
 let eventDetailsBySlug: Record<string, EventDetailsFixture> = {};
 const fetchedCitySlugs: string[] = [];
 const fetchedDetailSlugs: string[] = [];
+const personGateCalls: Array<Record<string, unknown>> = [];
+let findEmailThrows: Error | null = null;
+const { pendingRows, retryHandlers } = vi.hoisted(() => ({
+  pendingRows: [] as Array<{ raw: unknown }>,
+  retryHandlers: new Map<string, (raw: unknown) => Promise<string>>(),
+}));
+vi.mock("../src/_pending.ts", () => ({
+  persistPending: (row: { raw: unknown }) => pendingRows.push(row),
+  registerPendingRetry: (play: string, handler: (raw: unknown) => Promise<string>) =>
+    retryHandlers.set(play, handler),
+}));
 vi.mock("../src/_luma-discover.ts", () => ({
   cityToSlug: (city: string) =>
     ({ "san francisco": "sf", "new york": "nyc", london: "london" })[city.trim().toLowerCase()] ??
@@ -98,7 +109,10 @@ vi.mock("../src/_filter.ts", () => ({
   // qualification, so the classifier passes everyone; `_qualify.ts` staging
   // itself stays REAL here and is covered by qualify-staging.test.ts.
   hasRoleText: (p: { roleText?: string | null }) => (p.roleText ?? "").trim().length > 0,
-  qualifyPerson: async () => ({ verdict: personVerdict, reason: "stub" }),
+  qualifyPerson: async (input: { person: Record<string, unknown> }) => {
+    personGateCalls.push(input.person);
+    return { verdict: personVerdict, reason: "stub" };
+  },
 }));
 vi.mock("../src/_enrich.ts", () => ({
   enrichVerifiedContact: async () => {
@@ -160,6 +174,7 @@ vi.mock("@oneshot-gtm/core", async () => {
     },
     findEmail: async () => {
       sdkCalls.findEmail++;
+      if (findEmailThrows) throw findEmailThrows;
       return { result: { ...findEmailReturn, cost: 0.05 }, receiptId: 1 };
     },
     verifyEmail: async () => {
@@ -214,6 +229,9 @@ beforeEach(() => {
   // event. The auth-mode describe sets the cookie explicitly per test.
   delete process.env["LUMA_SESSION_COOKIE"];
   enqueued.length = 0;
+  personGateCalls.length = 0;
+  pendingRows.length = 0;
+  findEmailThrows = null;
   icpMatch = true;
   personVerdict = "pass";
   webSearchResults = [];
@@ -1028,5 +1046,94 @@ describe("runLumaFinder — person-level ICP gate", () => {
 
     expect(out.droppedRole).toBe(0);
     expect(out.enqueued).toBe(2);
+  });
+});
+
+describe("luma-events personGate", () => {
+  function setupEvent(): void {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Dana Host",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: "https://www.linkedin.com/in/dana",
+          twitterUrl: null,
+          bio: "Account Executive",
+          role: "Host",
+        },
+        // The finder skips events with fewer than two public attendees.
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: "https://gabe.dev",
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: "Marketing ops",
+          role: "Guest",
+        },
+      ],
+    };
+    enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = {
+      best_work_email: "dana@org.com",
+      company_domain: "org.com",
+    };
+  }
+
+  it("affinity mode marks every gate call and stamps the row for re-judging", async () => {
+    setupEvent();
+    await runLumaFinder({ ...baseConfig, personGate: "affinity" });
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person["affinity"]).toBe(true);
+    expect(enqueued.length).toBeGreaterThan(0);
+    for (const row of enqueued) expect(row.payload["icpAffinity"]).toBe(true);
+  });
+
+  it("the default role mode sends no affinity and stamps nothing", async () => {
+    setupEvent();
+    await runLumaFinder(baseConfig);
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person).not.toHaveProperty("affinity");
+    expect(enqueued.length).toBeGreaterThan(0);
+    for (const row of enqueued) expect(row.payload).not.toHaveProperty("icpAffinity");
+  });
+});
+
+describe("luma-events outage retry", () => {
+  it("keeps the trigger's affinity gate across a persisted retry", async () => {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: ["Gabe Guest", "Hana Guest"].map((name) => ({
+        name,
+        profileUrl: null,
+        websiteUrl: "https://guest.dev",
+        linkedinUrl: null,
+        twitterUrl: null,
+        bio: null,
+        role: "Guest",
+      })),
+    };
+    findEmailThrows = new Error("Tool request failed");
+    await runLumaFinder({ ...baseConfig, personGate: "affinity" });
+    expect(pendingRows.length).toBeGreaterThan(0);
+    expect(pendingRows[0]!.raw).toMatchObject({ personGate: "affinity" });
+
+    findEmailThrows = null;
+    personGateCalls.length = 0;
+    const retry = retryHandlers.get("luma-events")!;
+    await retry(JSON.parse(JSON.stringify(pendingRows[0]!.raw)));
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person["affinity"]).toBe(true);
   });
 });
