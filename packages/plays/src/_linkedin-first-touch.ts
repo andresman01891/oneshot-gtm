@@ -63,8 +63,11 @@ export function linkedInProfileOf(payload: Record<string, unknown>): string | nu
   return url && canonicalLinkedInProfileKey(url) ? url : null;
 }
 
-/** The finder's reason this person surfaced, as prompt lines. Only facts the payload carries. */
-function signalLines(row: LinkedInFirstTouchRow): string[] {
+/**
+ * The finder's reason this person surfaced, as prompt lines — shared by every
+ * non-email first touch. Only facts the payload carries.
+ */
+export function signalLines(row: LinkedInFirstTouchRow): string[] {
   const p = row.payload;
   const lines: string[] = [`PLAY: ${row.playName}`];
   const eventTitle = str(p, "eventTitle");
@@ -83,6 +86,13 @@ function signalLines(row: LinkedInFirstTouchRow): string[] {
     lines.push(
       `FUNDING: ${round}${str(p, "leadInvestor") ? ` led by ${str(p, "leadInvestor")}` : ""}`,
     );
+  const post = str(p, "postTitle");
+  if (post) lines.push(`LAUNCH_POST: ${post}`);
+  const episode = str(p, "episodeTitle");
+  if (episode)
+    lines.push(`PODCAST: ${episode}${str(p, "podcastName") ? ` on ${str(p, "podcastName")}` : ""}`);
+  const stack = str(p, "vendorStack");
+  if (stack) lines.push(`THEIR_STACK: ${stack}`);
   const job = str(p, "jobTitle");
   if (job) lines.push(`HIRING_FOR: ${job}`);
   const bio = str(p, "attendeeBio");

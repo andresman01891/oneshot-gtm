@@ -27,6 +27,40 @@ export function reachableChannels(payload: unknown): Channel[] {
   if (has("linkedinUrl") && /linkedin\.com\/in\//i.test(p["linkedinUrl"] as string)) {
     out.push("linkedin");
   }
-  if (has("handle") || has("twitterUrl")) out.push("x");
+  const text = (key: string) => (typeof p[key] === "string" ? (p[key] as string) : null);
+  if (xHandleFrom(text("handle")) ?? xHandleFrom(text("twitterUrl"))) out.push("x");
   return out;
 }
+
+/** An X handle (no @) from a handle or an x.com / twitter.com profile URL. */
+export function xHandleFrom(value: string | null | undefined): string | null {
+  const v = (value ?? "").trim();
+  const m = v.match(
+    /^(?:https?:\/\/)?(?:www\.|mobile\.)?(?:x|twitter)\.com\/@?([A-Za-z0-9_]{1,15})(?:[/?#]|$)/i,
+  );
+  const handle = m ? m[1]! : v.replace(/^@/, "");
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(handle)) return null;
+  return X_RESERVED_PATHS.has(handle.toLowerCase()) ? null : handle;
+}
+
+/** x.com paths that look like a handle but name no profile (mirrors core's channels.ts). */
+const X_RESERVED_PATHS = new Set([
+  "about",
+  "compose",
+  "explore",
+  "hashtag",
+  "home",
+  "i",
+  "intent",
+  "jobs",
+  "login",
+  "logout",
+  "messages",
+  "notifications",
+  "privacy",
+  "search",
+  "settings",
+  "share",
+  "signup",
+  "tos",
+]);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reachableChannels } from "./channels.ts";
+import { reachableChannels, xHandleFrom } from "./channels.ts";
 
 describe("reachableChannels", () => {
   it("lists every channel the payload has an address for", () => {
@@ -16,5 +16,16 @@ describe("reachableChannels", () => {
     expect(
       reachableChannels({ email: " ", linkedinUrl: "https://www.linkedin.com/company/acme" }),
     ).toEqual([]);
+    expect(reachableChannels({ twitterUrl: "https://x.com/home" })).toEqual([]);
+  });
+});
+
+describe("xHandleFrom", () => {
+  it("reads a handle from a handle or an X profile URL", () => {
+    expect(xHandleFrom("https://x.com/dana_lee")).toBe("dana_lee");
+    expect(xHandleFrom("@dana_lee")).toBe("dana_lee");
+    expect(xHandleFrom("not a handle!")).toBeNull();
+    expect(xHandleFrom("https://x.com/login")).toBeNull();
+    expect(xHandleFrom("https://x.com/home")).toBeNull();
   });
 });

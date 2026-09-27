@@ -7,6 +7,7 @@ import {
   personRecordFromResearch,
   channelOf,
   isWithdrawnStatus,
+  xHandleFrom,
   firstTouchSender,
   linkedInOutreachAccount,
   isOutreachChannel,
@@ -47,6 +48,7 @@ import {
   playMetadata,
   sendDraftedEmail,
   draftLinkedInNote,
+  draftXDm,
   sendLinkedInInvite,
 } from "@oneshot-gtm/plays";
 import { reportServerExecution } from "../telemetry.ts";
@@ -1011,25 +1013,41 @@ async function regenerateDraftInner(
   try {
     // A LinkedIn row is drafted as a connection-request note with the play's
     // signal, not as the play's email (channels.ts).
+    const draftRow = {
+      id: row.id,
+      playName: row.play_name,
+      payload: target && typeof target === "object" ? (target as Record<string, unknown>) : {},
+      notes: row.notes,
+    };
     drafted =
-      channelOf(row.channel) === "linkedin"
+      channelOf(row.channel) === "x" && row.play_name !== "x-amplify-dm"
         ? [
             {
-              ...(await draftLinkedInNote(
-                {
-                  id: row.id,
-                  playName: row.play_name,
-                  payload:
-                    target && typeof target === "object" ? (target as Record<string, unknown>) : {},
-                  notes: row.notes,
-                },
-                { draftAngle: angle?.text ?? null },
-              )),
+              ...(await draftXDm(draftRow, { draftAngle: angle?.text ?? null })),
               sent: false,
               receiptIds: [],
             },
           ]
-        : await dispatchPlay(row.play_name, body, undefined, undefined, angle?.text);
+        : channelOf(row.channel) === "linkedin"
+          ? [
+              {
+                ...(await draftLinkedInNote(
+                  {
+                    id: row.id,
+                    playName: row.play_name,
+                    payload:
+                      target && typeof target === "object"
+                        ? (target as Record<string, unknown>)
+                        : {},
+                    notes: row.notes,
+                  },
+                  { draftAngle: angle?.text ?? null },
+                )),
+                sent: false,
+                receiptIds: [],
+              },
+            ]
+          : await dispatchPlay(row.play_name, body, undefined, undefined, angle?.text);
   } catch (err) {
     return jsonResponse({ error: (err as Error).message }, 400, req);
   }
@@ -1143,7 +1161,13 @@ export async function markSentRoute(
   const pstr = (k: string): string | null => (typeof payload[k] === "string" ? payload[k] : null);
   // The profile the touch went to. `prospects.linkedin_url` holds whichever
   // social profile a prospect was reached on (it has always carried X URLs).
-  const profileUrl = channel === "linkedin" ? pstr("linkedinUrl") : pstr("twitterUrl");
+  // On X that is the handle the draft was addressed to (handle first, then
+  // the profile URL — draftXDm's order), recorded as its profile URL.
+  const xHandle = xHandleFrom(pstr("handle")) ?? xHandleFrom(pstr("twitterUrl"));
+  if (channel === "x" && !xHandle) {
+    return jsonResponse({ error: "this row has no X handle to have sent it to" }, 400, req);
+  }
+  const profileUrl = channel === "linkedin" ? pstr("linkedinUrl") : `https://x.com/${xHandle}`;
 
   const prospectId = ledger.upsertProspect({
     name: pstr("name"),
