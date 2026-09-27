@@ -9,6 +9,7 @@ import { icpFields, resolveVerifyEnrichQualify } from "./_contact.ts";
 import { enqueueScoredTarget } from "./_priority-adapters.ts";
 import { persistRoleRejection, qualifyPostEnrich } from "./_qualify.ts";
 import { isDuplicate } from "./_dedupe.ts";
+import { finderChannels } from "./_channels-context.ts";
 import { icpFilter, resolveIcp } from "./_filter.ts";
 import { safeCompanySearch, safeLocalSearch, safePeopleSearch } from "./_sdk-safe.ts";
 import { buildDesignPartnerLoiPayload, dedupePlayNames, resolvePlayRoute } from "./_play-route.ts";
@@ -301,6 +302,7 @@ export async function runLocalBusinessFinder(opts: LocalBusinessFinderOpts): Pro
     const bestWorkEmail = person.best_work_email?.trim() || null;
 
     let email: string;
+    let channel: "email" | "linkedin" = "email";
     let phone: string | null;
     let linkedinUrl: string | null;
     let finalTitle: string | null;
@@ -309,7 +311,9 @@ export async function runLocalBusinessFinder(opts: LocalBusinessFinderOpts): Pro
     // pre-#705 shape (finding PRRT_kwDOSKzrBs6mB74J, issue #705 round 1).
     let routedIcp: Record<string, unknown> = {};
 
-    if (bestWorkEmail) {
+    // Lane 1 only when email leads the run's channel order; otherwise the
+    // shared spine walks the order, reusing the search's email if it gets there.
+    if (bestWorkEmail && finderChannels()[0] === "email") {
       // Lane 1 — the search already carries a usable email: skip
       // findEmail/verifyEmail entirely and go straight to the person gate.
       const gate = await qualifyPostEnrich({
@@ -355,12 +359,13 @@ export async function runLocalBusinessFinder(opts: LocalBusinessFinderOpts): Pro
         ...(gate.reason ? { icpVerdictReason: gate.reason } : {}),
       };
     } else {
-      // Lane 2 — no email on the search result: the normal
+      // Lane 2 — no email on the search result (or email isn't first): the normal
       // resolve → verify → enrich → qualify spine every other finder uses.
       const contact = await resolveVerifyEnrichQualify({
         playName: PLAY_NAME,
         fullName,
         companyDomain: person.company_domain ?? null,
+        knownEmail: bestWorkEmail,
         isDuplicate: (candEmail) =>
           isDuplicate({ playName: dedupeScope, dedupeKey, prospectEmail: candEmail }),
         icp,
@@ -385,7 +390,9 @@ export async function runLocalBusinessFinder(opts: LocalBusinessFinderOpts): Pro
         } else result.droppedEnrichment++;
         continue;
       }
-      email = contact.email;
+      // "" on a LinkedIn-channel contact: the row's channel decides how it is sent.
+      email = contact.email ?? "";
+      channel = contact.channel;
       phone = contact.phone;
       linkedinUrl = contact.linkedinUrl;
       finalTitle = contact.title ?? title;
@@ -426,6 +433,7 @@ export async function runLocalBusinessFinder(opts: LocalBusinessFinderOpts): Pro
       source: SOURCE,
       fitReason: filter.reason,
       notes: filter.reason,
+      channel,
     });
     if (id != null) result.enqueued++;
     else result.droppedDuplicate++;
@@ -620,7 +628,7 @@ async function runLocalEngine(opts: LocalBusinessFinderOpts): Promise<FinderResu
     const phone = contact.phone ?? biz.phone ?? null;
     const target = {
       name: contact.fullName ?? name,
-      email: contact.email,
+      email: contact.email ?? "",
       company: name,
       businessType,
       yourEdge,
@@ -649,6 +657,7 @@ async function runLocalEngine(opts: LocalBusinessFinderOpts): Promise<FinderResu
       source: SOURCE,
       fitReason: filter.reason,
       notes: filter.reason,
+      channel: contact.channel,
     });
     if (id != null) result.enqueued++;
     else result.droppedDuplicate++;

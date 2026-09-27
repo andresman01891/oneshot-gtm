@@ -16,6 +16,7 @@ interface EnqueuedRow {
   source: string;
   initialStatus?: string;
   notes?: string;
+  channel?: string;
 }
 
 const enqueued: EnqueuedRow[] = [];
@@ -185,6 +186,7 @@ vi.mock("@oneshot-gtm/core", async () => {
       findContactReceipt: () => null,
       isQueueDuplicate: () => false,
       isPendingResolution: () => false,
+      isLinkedInProfileKnown: () => false,
       upsertPendingResolution: () => {},
       setCachedEnrichment: () => {},
       enqueueTarget: (row: EnqueuedRow) => {
@@ -1135,5 +1137,51 @@ describe("luma-events outage retry", () => {
     await retry(JSON.parse(JSON.stringify(pendingRows[0]!.raw)));
     expect(personGateCalls.length).toBeGreaterThan(0);
     for (const person of personGateCalls) expect(person["affinity"]).toBe(true);
+  });
+});
+
+describe("luma-events channels", () => {
+  it("queues an attendee with no email on LinkedIn when the run allows it", async () => {
+    const { withFinderChannels } = await import("../src/_channels-context.ts");
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Dana Host",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: "https://www.linkedin.com/in/dana",
+          twitterUrl: null,
+          bio: "Founder",
+          role: "Host",
+        },
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: "Guest",
+        },
+      ],
+    };
+    // Enrichment by LinkedIn gives a company domain but no email, and findEmail misses.
+    enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = { company_domain: "org.com" };
+    findEmailReturn = { found: false, email: null };
+
+    await withFinderChannels(["email", "linkedin"], () => runLumaFinder(baseConfig));
+
+    const dana = enqueued.find((r) => r.payload["name"] === "Dana Host");
+    expect(dana).toMatchObject({ channel: "linkedin" });
+    expect(dana!.payload["linkedinUrl"]).toBe("https://www.linkedin.com/in/dana");
+    expect(dana!.payload["email"]).toBe("");
+    // Without an address on either channel, Gabe is not queued.
+    expect(enqueued.find((r) => r.payload["name"] === "Gabe Guest")).toBeUndefined();
   });
 });
