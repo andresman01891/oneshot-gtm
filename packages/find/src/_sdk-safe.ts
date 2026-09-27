@@ -287,6 +287,23 @@ export function personCacheKey(input: DeepResearchPersonInput): string | null {
   return email ? `person:${email}` : null;
 }
 
+/**
+ * True when `safeDeepResearchPerson` would answer this input from the cache
+ * for free: a fresh, successful entry under its key. A negative entry does
+ * not count — it returns the failed sentinel, which is not research.
+ */
+export function hasCachedResearch(input: DeepResearchPersonInput): boolean {
+  const key = personCacheKey(input);
+  if (!key) return false;
+  try {
+    const cached = getLedger().getCachedEnrichment(key);
+    if (!cached || cached.status === "failed") return false;
+    return Date.now() - new Date(cached.fetched_at).getTime() < RESEARCH_CACHE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
 /** Graceful sentinel — same `receiptId: 0` / `cost: 0` shape as the cache-miss
  *  sentinels in _enrich.ts, so callers spend nothing and drop just this row. */
 const FAILED_RESEARCH = {
@@ -309,6 +326,7 @@ const FAILED_RESEARCH = {
 export async function safeDeepResearchPerson(
   input: DeepResearchPersonInput,
   ctx: CallContext,
+  opts: { cacheOnly?: boolean } = {},
 ): Promise<Awaited<ReturnType<typeof deepResearchPerson>>> {
   const ledger = getLedger();
   const key = personCacheKey(input);
@@ -334,6 +352,10 @@ export async function safeDeepResearchPerson(
       }
     }
   }
+
+  // Cache only: a miss, an expired entry or a corrupt one is a miss, never a
+  // paid call. The failed sentinel is what callers already treat as "no research".
+  if (opts.cacheOnly) return { result: FAILED_RESEARCH, receiptId: 0 };
 
   try {
     const live = deepResearchPerson(input, ctx);

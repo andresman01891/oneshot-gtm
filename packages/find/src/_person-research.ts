@@ -21,6 +21,7 @@
  */
 import {
   boundPersonResearch,
+  canonicalLinkedInProfileKey,
   getLedger,
   hasDossierSignal,
   isPersonResearchDossier,
@@ -51,7 +52,7 @@ import {
 } from "./_linkedin-profile.ts";
 import { isResearchableUrl } from "./_profile-url.ts";
 import { safeScorePriority } from "./_priority-adapters.ts";
-import { safeDeepResearchPerson, safeEnrichCompany } from "./_sdk-safe.ts";
+import { hasCachedResearch, safeDeepResearchPerson, safeEnrichCompany } from "./_sdk-safe.ts";
 import type { FinderResult } from "./_types.ts";
 
 export const PERSON_RESEARCH_COST_ESTIMATE_USD = 0.05;
@@ -209,6 +210,33 @@ export function namesAgree(
 }
 
 /**
+ * Stricter than `namesAgree`, for keeping an identifier rather than reading a
+ * record: the row's first AND last name tokens must each match a token of the
+ * record's name (same accent folding and 4-letter prefix tolerance). A shared
+ * surname alone ("Julia Smith" vs "Marcus Smith") does not attach Marcus's
+ * profile to Julia. No row name, a one-token row name, or no record name: the
+ * URL cannot be tied to the person, so it is not kept.
+ */
+export function namesIdentify(
+  rowName: string | null | undefined,
+  recordName: string | null | undefined,
+): boolean {
+  if (!rowName || !recordName) return false;
+  const a = nameTokens(rowName);
+  const b = nameTokens(recordName);
+  if (a.length < 2 || b.length === 0) return false;
+  const matches = (x: string): boolean =>
+    b.some(
+      (y) =>
+        x === y ||
+        (x.length >= 4 &&
+          y.length >= 4 &&
+          (x.startsWith(y.slice(0, 4)) || y.startsWith(x.slice(0, 4)))),
+    );
+  return matches(a[0]!) && matches(a[a.length - 1]!);
+}
+
+/**
  * A seed whose "name" is the business, not a person (local-business rows put
  * the company in both fields): the provider's person name has nothing to
  * agree with, so the guard stays out of the way.
@@ -230,6 +258,32 @@ function providerPersonName(result: unknown): string | null {
   const first = str(inner, "first_name") ?? str(enrichment, "first_name");
   const last = str(inner, "last_name") ?? str(enrichment, "last_name");
   return [first, last].filter(Boolean).join(" ") || null;
+}
+
+const LINKEDIN_KEY_PREFIX = "linkedin.com/in/";
+
+/**
+ * The provider's LinkedIn profile for the person, as a canonical
+ * `https://www.linkedin.com/in/<slug>` URL. Every `deepResearchPerson` result
+ * carries `linkedin_url`, and for a GitHub, X or email seed it is often the
+ * only LinkedIn profile the row will ever get. Null when it is not a `/in/`
+ * profile, when the record names someone other than the row, or when the
+ * seed names a business (nobody to agree with).
+ */
+export function providerLinkedInUrl(
+  result: unknown,
+  seed: Pick<PersonSeed, "name" | "company"> | null,
+): string | null {
+  if (!isRecord(result) || result["status"] === "failed") return null;
+  const inner = isRecord(result["result"]) ? (result["result"] as JsonRecord) : {};
+  const enrichment = isRecord(inner["enrichment"]) ? (inner["enrichment"] as JsonRecord) : {};
+  const raw = str(inner, "linkedin_url") ?? str(enrichment, "linkedin_url");
+  if (!raw) return null;
+  const key = canonicalLinkedInProfileKey(raw.startsWith("http") ? raw : `https://${raw}`);
+  if (!key?.startsWith(LINKEDIN_KEY_PREFIX)) return null;
+  if (seed && seedNamesABusiness(seed)) return null;
+  if (!namesIdentify(seed?.name, providerPersonName(result))) return null;
+  return `https://www.linkedin.com/in/${encodeURIComponent(key.slice(LINKEDIN_KEY_PREFIX.length))}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +474,12 @@ export interface ResearchPersonInput {
   enrichCompany?: boolean;
   /** Read the live LinkedIn profile when the seed is one and a session is configured (default true). */
   liveProfile?: boolean;
+  /**
+   * Re-derive from the shared research cache only: no paid call of any kind
+   * (no provider call, no retry by email, no live read, no company lookup
+   * outside its cache). A seed with nothing cached comes back `notCached`.
+   */
+  cacheOnly?: boolean;
 }
 
 /**
@@ -442,6 +502,8 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
   cached: boolean;
   /** Why the live LinkedIn tier did not produce a profile, when it ran and did not. Structured, for callers that stop on it. */
   liveSkipped?: LiveProfileSkip;
+  /** `cacheOnly` and nothing cached for the seed: nothing was researched; do not write the dossier. */
+  notCached?: boolean;
 }> {
   const { seed } = input;
   if (!seed) {
@@ -451,7 +513,21 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
       cached: false,
     };
   }
-  if (input.remainingUsd < PERSON_RESEARCH_COST_ESTIMATE_USD) {
+  const providerInput = {
+    ...(seed.url ? { socialMediaUrl: seed.url } : {}),
+    ...(seed.email ? { email: seed.email } : {}),
+    ...(seed.name ? { name: seed.name } : {}),
+    ...(seed.company && seed.company !== "(unknown)" ? { company: seed.company } : {}),
+  };
+  if (input.cacheOnly && !hasCachedResearch(providerInput)) {
+    return {
+      dossier: unavailable(seed, "not in the research cache"),
+      costUsd: 0,
+      cached: true,
+      notCached: true,
+    };
+  }
+  if (!input.cacheOnly && input.remainingUsd < PERSON_RESEARCH_COST_ESTIMATE_USD) {
     return {
       dossier: unavailable(seed, "person research skipped: cost cap reached"),
       costUsd: 0,
@@ -464,15 +540,15 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
     memo: "person research: current role and company before review",
     decisionContext: { source: "person-research", ...input.subject },
   };
-  let res = await safeDeepResearchPerson(
-    {
-      ...(seed.url ? { socialMediaUrl: seed.url } : {}),
-      ...(seed.email ? { email: seed.email } : {}),
-      ...(seed.name ? { name: seed.name } : {}),
-      ...(seed.company && seed.company !== "(unknown)" ? { company: seed.company } : {}),
-    },
-    ctx,
-  );
+  let res = await safeDeepResearchPerson(providerInput, ctx, { cacheOnly: input.cacheOnly });
+  if (input.cacheOnly && (!res.result || res.result.status === "failed")) {
+    return {
+      dossier: unavailable(seed, "not in the research cache"),
+      costUsd: 0,
+      cached: true,
+      notCached: true,
+    };
+  }
   let billed = res.receiptId !== 0;
   let costUsd = billed ? (res.result?.cost ?? 0) : 0;
   // The URL was the finder's guess. When the provider's record names someone
@@ -493,16 +569,21 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
       "warn",
     );
     // The retry is a second paid call; it needs the same headroom the first one had.
+    const retryInput = {
+      ...(seed.email ? { email: seed.email } : {}),
+      ...(seed.name ? { name: seed.name } : {}),
+      ...(seed.company && seed.company !== "(unknown)" ? { company: seed.company } : {}),
+    };
     const canRetry =
-      Boolean(seed.email) && input.remainingUsd - costUsd >= PERSON_RESEARCH_COST_ESTIMATE_USD;
+      Boolean(seed.email) &&
+      (input.cacheOnly
+        ? hasCachedResearch(retryInput)
+        : input.remainingUsd - costUsd >= PERSON_RESEARCH_COST_ESTIMATE_USD);
     if (canRetry) {
       const retry = await safeDeepResearchPerson(
-        {
-          ...(seed.email ? { email: seed.email } : {}),
-          ...(seed.name ? { name: seed.name } : {}),
-          ...(seed.company && seed.company !== "(unknown)" ? { company: seed.company } : {}),
-        },
+        retryInput,
         { ...ctx, memo: "person research: by email after the profile URL named someone else" },
+        { cacheOnly: input.cacheOnly },
       );
       if (retry.receiptId !== 0) costUsd += retry.result?.cost ?? 0;
       const retryName = providerPersonName(retry.result);
@@ -536,7 +617,12 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
   // and the founder's session is configured. Its Experience list wins on
   // currency over the provider's (see reconcileOrganizations).
   let live: LiveProfileRead | null = null;
-  if (input.liveProfile !== false && seed.url && isLinkedInProfileUrl(seed.url)) {
+  if (
+    input.liveProfile !== false &&
+    !input.cacheOnly &&
+    seed.url &&
+    isLinkedInProfileUrl(seed.url)
+  ) {
     if (linkedinSessionState() !== "unset") {
       live = await readLinkedInProfile(
         seed.url,
@@ -580,6 +666,9 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
   const bio = str(enrichment, "bio", "summary", "headline") ?? live?.profile?.headline ?? undefined;
   const location = str(enrichment, "location") ?? live?.profile?.location ?? undefined;
   const workEmail = str(enrichment, "best_work_email")?.toLowerCase() ?? undefined;
+  const linkedinUrl = providerFailed
+    ? undefined
+    : (providerLinkedInUrl(res.result, seed) ?? undefined);
   const liveWarning =
     live && !live.profile && live.skipped && live.skipped !== "not-linkedin"
       ? `live profile skipped: ${live.skipped}`
@@ -612,7 +701,11 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
         // corrupt cache → refetch
       }
     }
-    if (!company && costUsd + COMPANY_RESEARCH_COST_ESTIMATE_USD <= input.remainingUsd) {
+    if (
+      !company &&
+      !input.cacheOnly &&
+      costUsd + COMPANY_RESEARCH_COST_ESTIMATE_USD <= input.remainingUsd
+    ) {
       const sameCompany =
         seed.company != null && normalizeCompany(seed.company) === normalizeCompany(current.name);
       const enriched = await safeEnrichCompany(
@@ -660,6 +753,7 @@ export async function researchPerson(input: ResearchPersonInput): Promise<{
     ...(bio ? { bio: bio.replace(/\s+/g, " ").slice(0, 600) } : {}),
     ...(location ? { location } : {}),
     ...(workEmail ? { workEmail } : {}),
+    ...(linkedinUrl ? { linkedinUrl } : {}),
     ...(company ? { company } : {}),
     ...(live?.profile
       ? { liveProfile: { url: live.profile.url, readAt: live.profile.readAt } }
@@ -694,6 +788,7 @@ export function dossierFromProviderResult(
   const bio = str(enrichment, "bio", "summary", "headline") ?? undefined;
   const location = str(enrichment, "location") ?? undefined;
   const workEmail = str(enrichment, "best_work_email")?.toLowerCase() ?? undefined;
+  const linkedinUrl = providerLinkedInUrl(result, seed) ?? undefined;
   if (!current && organizations.length === 0 && !bio) return null;
   return boundPersonResearch({
     version: 1,
@@ -718,6 +813,7 @@ export function dossierFromProviderResult(
     ...(bio ? { bio: bio.replace(/\s+/g, " ").slice(0, 600) } : {}),
     ...(location ? { location } : {}),
     ...(workEmail ? { workEmail } : {}),
+    ...(linkedinUrl ? { linkedinUrl } : {}),
     costUsd: opts.billed ? opts.costUsd : 0,
     cached: !opts.billed,
   });
@@ -758,6 +854,8 @@ export interface PersonPayloadPatch extends JsonRecord {
   companyFacts?: string;
   formerRoles?: string;
   productResearch?: null;
+  /** Filled from research only when the row had none; never replaces a finder's URL. */
+  linkedinUrl?: string;
 }
 
 /**
@@ -806,6 +904,7 @@ export function personPayloadPatch(
   if (companyFacts) patch.companyFacts = companyFacts;
   const formerRoles = renderFormerRoles(dossier);
   if (formerRoles) patch.formerRoles = formerRoles;
+  if (dossier.linkedinUrl && !str(payload, "linkedinUrl")) patch.linkedinUrl = dossier.linkedinUrl;
   return patch;
 }
 
@@ -909,6 +1008,7 @@ export function researchMergePatch(dossier: PersonResearchDossier): JsonRecord {
     liveProfile: dossier.liveProfile ?? null,
     currentRole: dossier.currentRole ?? null,
     company: dossier.company ?? null,
+    linkedinUrl: dossier.linkedinUrl ?? null,
   };
 }
 
@@ -1192,6 +1292,11 @@ export async function applyPersonResearchToProspect(
   const merged = mergePersonResearchDossier(current.dossier_json, dossier);
   const half = readPersonHalf(merged);
   ledger.mergeProspectDossierHalf(prospect.id, "person", half, opts.dossierSlice);
+  // Write-once: a prospect that already has a URL in `linkedin_url` (a
+  // LinkedIn profile, or the X/GitHub URL some plays keep there) keeps it.
+  if (dossier.linkedinUrl) {
+    ledger.updateProspectIdentity(prospect.id, { linkedin_url: dossier.linkedinUrl });
+  }
   if (patch.title !== undefined || patch.company !== undefined) {
     ledger.setProspectCurrentRole(prospect.id, {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
