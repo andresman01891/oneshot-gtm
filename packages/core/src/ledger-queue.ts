@@ -3,6 +3,7 @@ import { DraftVersionStore, draftVersionAngle, type DraftDiscardReason } from ".
 import { extractBusinessAddress } from "./mail-address.ts";
 import { humanDecisionWhereSql } from "./labels.ts";
 import { toSqliteUtc } from "./time.ts";
+import type { OutreachChannel } from "./channels.ts";
 import type {
   IcpDecisionExample,
   ProspectPriority,
@@ -218,14 +219,16 @@ export class QueueStore {
      * producers that can't score (manual rows, legacy callers, auto-drops).
      */
     priority?: ProspectPriority | null;
+    /** Outreach channel of the first touch; defaults to email (channels.ts). */
+    channel?: OutreachChannel;
   }): number | null {
     try {
       const status = input.initialStatus ?? "pending";
       const reviewedAt = status === "pending" ? null : new Date().toISOString();
       const result = this.db
         .prepare(
-          `INSERT INTO target_queue(play_name, payload_json, dedupe_key, source, status, reviewed_at, notes, priority_json, decision, decided_at, decided_by)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO target_queue(play_name, payload_json, dedupe_key, source, status, reviewed_at, notes, priority_json, decision, decided_at, decided_by, channel)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.playName,
@@ -251,6 +254,7 @@ export class QueueStore {
           status === "rejected" ? "auto_reject" : null,
           status === "rejected" ? reviewedAt : null,
           status === "rejected" ? "machine" : null,
+          input.channel ?? "email",
         );
       return Number(result.lastInsertRowid);
     } catch (err) {
@@ -1029,15 +1033,24 @@ export class QueueStore {
   }
 
   /** Slot + identity for a queue row's draft versions; null when the row is gone. */
-  private queueVersionKey(
-    id: number,
-  ): { slot: { queueId: number }; playName: string; prospectKey: string; stepIndex: 0 } | null {
+  private queueVersionKey(id: number): {
+    slot: { queueId: number };
+    playName: string;
+    prospectKey: string;
+    stepIndex: 0;
+    channel: string;
+  } | null {
     const row = this.db
       .query(
-        `SELECT play_name, dedupe_key, json_extract(payload_json, '$.email') AS email
+        `SELECT play_name, dedupe_key, channel, json_extract(payload_json, '$.email') AS email
            FROM target_queue WHERE id = ?`,
       )
-      .get(id) as { play_name: string; dedupe_key: string; email: string | null } | null;
+      .get(id) as {
+      play_name: string;
+      dedupe_key: string;
+      channel: string;
+      email: string | null;
+    } | null;
     if (!row) return null;
     const email = typeof row.email === "string" ? row.email.trim().toLowerCase() : "";
     return {
@@ -1045,6 +1058,7 @@ export class QueueStore {
       playName: row.play_name,
       prospectKey: email || row.dedupe_key,
       stepIndex: 0,
+      channel: row.channel,
     };
   }
 
