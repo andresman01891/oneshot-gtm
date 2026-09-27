@@ -20,7 +20,37 @@ export type LinkedInOperation =
       text: string;
       idempotencyKey: string;
     }
-  | { kind: "wait"; requestId: string };
+  | { kind: "wait"; requestId: string }
+  | { kind: "account"; accountId: string }
+  | {
+      kind: "invite";
+      accountId: string;
+      /** linkedin.com/in/<slug> URL or provider id. */
+      profile: string;
+      note?: string;
+      idempotencyKey: string;
+      /** The play the invite belongs to, for the receipt. */
+      playName: string;
+    }
+  | {
+      kind: "withdraw";
+      accountId: string;
+      /** OneShot's stable invitation id returned by the invite. */
+      invitationId: string;
+      idempotencyKey: string;
+      playName: string;
+    };
+
+/**
+ * Whether a withdraw result means our invite is no longer outstanding
+ * because of us: withdrawn now, cancelled before it went out, or already
+ * withdrawn. `not_pending` (accepted, or gone for another reason) is not.
+ */
+export function isWithdrawnStatus(status: string | null | undefined): boolean {
+  return (
+    status === "withdrawn" || status === "cancelled_before_send" || status === "already_withdrawn"
+  );
+}
 
 /** All messaging calls go through the SDK. Read operations never trigger a paid history sync. */
 export async function linkedInSdk(operation: LinkedInOperation): Promise<unknown> {
@@ -39,7 +69,7 @@ export async function linkedInSdk(operation: LinkedInOperation): Promise<unknown
     case "connect":
       return operation.accountId && !operation.upgrade
         ? agent.reconnectLinkedInAccount(operation.accountId)
-        : agent.linkedinConnect({ requestedActions: ["read", "reply", "view_profile"] });
+        : agent.linkedinConnect({ requestedActions: ["read", "reply", "view_profile", "invite"] });
     case "revoke":
       return agent.revokeLinkedInAccount(operation.accountId);
     case "connection":
@@ -97,16 +127,62 @@ export async function linkedInSdk(operation: LinkedInOperation): Promise<unknown
     }
     case "wait":
       return agent.waitForResult(operation.requestId, { timeout: 2 });
+    case "account":
+      return agent.getLinkedInAccount(operation.accountId);
+    case "invite": {
+      const account = await agent.getLinkedInAccount(operation.accountId);
+      if (account.status !== "connected" || !account.allowed_actions.includes("invite"))
+        throw new Error("Reconnect this LinkedIn account with permission to send invitations");
+      const result = await agent.linkedinInvite({
+        accountId: operation.accountId,
+        profile: operation.profile,
+        ...(operation.note ? { note: operation.note } : {}),
+        idempotencyKey: operation.idempotencyKey,
+        ...buildAuditOpts({ playName: operation.playName }, "linkedin.invite"),
+      });
+      record(
+        result,
+        "linkedin.invite",
+        operation.playName,
+        `${operation.playName} LinkedIn invite`,
+      );
+      return result;
+    }
+    case "withdraw": {
+      const result = await agent.linkedinWithdrawInvitation({
+        accountId: operation.accountId,
+        invitationId: operation.invitationId,
+        idempotencyKey: operation.idempotencyKey,
+        ...buildAuditOpts({ playName: operation.playName }, "linkedin.withdraw"),
+      });
+      record(
+        result,
+        "linkedin.withdraw",
+        operation.playName,
+        `${operation.playName} LinkedIn invite withdrawal`,
+      );
+      return result;
+    }
   }
 }
-function record(result: unknown, callType: string) {
+function record(
+  result: unknown,
+  callType: string,
+  playName = "inbox-reply",
+  memo = `LinkedIn ${callType} from Replies`,
+) {
   const r = result as Record<string, unknown>;
   getLedger().recordReceipt({
-    playName: "inbox-reply",
+    playName,
     callType,
     signedReceipt: result,
     costUsd: typeof r.cost === "number" ? r.cost : undefined,
-    oneshotRequestId: typeof r.request_id === "string" ? r.request_id : undefined,
-    memo: `LinkedIn ${callType} from Replies`,
+    oneshotRequestId:
+      typeof r.request_id === "string"
+        ? r.request_id
+        : typeof r.action_request_id === "string"
+          ? r.action_request_id
+          : undefined,
+    memo,
   });
 }

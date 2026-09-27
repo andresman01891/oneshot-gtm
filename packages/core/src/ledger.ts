@@ -3006,10 +3006,16 @@ export class Ledger {
     id: number;
     previousDraft: string | null;
     previousPayload: string;
+    previousChannel?: string;
     draft: Parameters<Ledger["setQueueDraft"]>[0]["draft"];
     discardReason?: DraftDiscardReason;
   }): boolean {
     return this.queue.setQueueDraftIfCurrent(input);
+  }
+
+  /** Move an unsent row to another outreach channel, dropping its draft — see QueueStore.setQueueChannel. */
+  setQueueChannel(id: number, channel: OutreachChannel): "changed" | "sent" | "busy" {
+    return this.queue.setQueueChannel(id, channel);
   }
 
   /** Drop a row's stored draft (and close its open version as a redraft) — see QueueStore.clearQueueDraft. */

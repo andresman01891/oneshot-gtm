@@ -6,7 +6,11 @@ import {
   isPersonResearchDossier,
   personRecordFromResearch,
   channelOf,
+  isWithdrawnStatus,
   firstTouchSender,
+  linkedInOutreachAccount,
+  isOutreachChannel,
+  channelAddresses,
 } from "@oneshot-gtm/core";
 import {
   currentWorkspaceName,
@@ -42,6 +46,8 @@ import {
   logTargetError,
   playMetadata,
   sendDraftedEmail,
+  draftLinkedInNote,
+  sendLinkedInInvite,
 } from "@oneshot-gtm/plays";
 import { reportServerExecution } from "../telemetry.ts";
 import {
@@ -66,6 +72,7 @@ import {
   type RunPlayRequest,
 } from "@oneshot-gtm/shared-types";
 import { jsonResponse } from "../server.ts";
+import { callLinkedIn } from "../linkedin-client.ts";
 import { sendsToday } from "./_capacity.ts";
 import { dispatchPlay } from "./_play-dispatch.ts";
 import { buildProspectTimeline } from "./_prospect-timeline.ts";
@@ -876,10 +883,18 @@ export async function drainQueueRoute(req: Request): Promise<Response> {
   const t0 = performance.now();
   let outcome: TelemetryOutcome = "ok";
   try {
+    const account = linkedInOutreachAccount();
     const result = await drainQueue({
       playName: body.playName,
       limit: body.limit ?? 10,
       dryRun: !!body.dryRun,
+      linkedIn: account
+        ? {
+            accountId: account.accountId,
+            workspace: account.workspace,
+            call: (operation) => callLinkedIn(account.workspace, operation),
+          }
+        : null,
     });
     const view: DrainResult = {
       drained: result.drained,
@@ -994,7 +1009,27 @@ async function regenerateDraftInner(
 
   let drafted: Awaited<ReturnType<typeof dispatchPlay>>;
   try {
-    drafted = await dispatchPlay(row.play_name, body, undefined, undefined, angle?.text);
+    // A LinkedIn row is drafted as a connection-request note with the play's
+    // signal, not as the play's email (channels.ts).
+    drafted =
+      channelOf(row.channel) === "linkedin"
+        ? [
+            {
+              ...(await draftLinkedInNote(
+                {
+                  id: row.id,
+                  playName: row.play_name,
+                  payload:
+                    target && typeof target === "object" ? (target as Record<string, unknown>) : {},
+                  notes: row.notes,
+                },
+                { draftAngle: angle?.text ?? null },
+              )),
+              sent: false,
+              receiptIds: [],
+            },
+          ]
+        : await dispatchPlay(row.play_name, body, undefined, undefined, angle?.text);
   } catch (err) {
     return jsonResponse({ error: (err as Error).message }, 400, req);
   }
@@ -1034,6 +1069,7 @@ async function regenerateDraftInner(
     id,
     previousDraft: row.last_draft_json ?? null,
     previousPayload: row.payload_json,
+    previousChannel: row.channel,
     draft: out,
     // What the founder said about the draft this replaces: rotate = the
     // angle was wrong, plain regenerate = the text was (angle kept).
@@ -1234,6 +1270,57 @@ export async function sendDraftRoute(
   } catch {
     // fall through — handled by the missing-email check below
   }
+  // LinkedIn row: the reviewed note goes out verbatim as a connection request
+  // through OneShot's invite route, from the account's owning workspace.
+  if (channelOf(row.channel) === "linkedin") {
+    const account = linkedInOutreachAccount();
+    if (!account) {
+      ledger.clearQueueSendingMarker(id);
+      return jsonResponse({ error: "connect LinkedIn on /setup before sending invites" }, 409, req);
+    }
+    try {
+      const out = await sendLinkedInInvite({
+        row: { id, playName: row.play_name, payload, notes: row.notes },
+        note: body,
+        sender: {
+          accountId: account.accountId,
+          workspace: account.workspace,
+          call: (operation) => callLinkedIn(account.workspace, operation),
+        },
+        workspace: currentWorkspaceName(),
+      });
+      if (!out.sent) {
+        ledger.clearQueueSendingMarker(id);
+        return jsonResponse({ error: out.flags.join("; "), flags: out.flags }, 409, req);
+      }
+      try {
+        ledger.setQueueProspectId(id, out.prospectId);
+      } catch {
+        // best-effort backfill — the invite is already recorded
+      }
+      ledger.setQueueStatus({ id, status: "sent", decidedBy: "human" });
+      try {
+        ledger.closeQueueDraftVersion(id, "sent");
+      } catch {
+        // older ledgers / test doubles without draft versions
+      }
+      return jsonResponse(
+        {
+          ok: true,
+          prospectId: out.prospectId,
+          invitationId: out.invitationId,
+          status: out.status,
+        },
+        200,
+        req,
+      );
+    } catch (err) {
+      ledger.clearQueueSendingMarker(id);
+      const message = (err as Error).message ?? "LinkedIn invite failed";
+      return jsonResponse({ error: message }, isSendDeferred(err) ? 429 : 502, req);
+    }
+  }
+
   const str = (k: string): string | null => (typeof payload[k] === "string" ? payload[k] : null);
   const email = str("email") ?? str("founderEmail");
   if (!email) return jsonResponse({ error: "row has no recipient email" }, 400, req);
@@ -1361,4 +1448,131 @@ export async function sendDraftRoute(
   });
 
   return done("ok", jsonResponse({ sent: true, receiptIds: result.receiptIds }, 200, req));
+}
+
+/**
+ * Withdraw the LinkedIn invite a sent row went out with, through OneShot's
+ * withdraw route. Recorded as its own step-0 `withdrawn` event; the original
+ * send stays in the history. Never disconnects an accepted connection —
+ * OneShot answers `not_pending` for those.
+ */
+export async function withdrawInviteRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  if (channelOf(row.channel) !== "linkedin") {
+    return jsonResponse({ error: "only a LinkedIn row has an invite to withdraw" }, 400, req);
+  }
+  if (row.status !== "sent" || row.prospect_id == null) {
+    return jsonResponse({ error: "this row's invite hasn't been sent" }, 400, req);
+  }
+  const events = ledger
+    .listSequenceEventsForProspectPlay(row.prospect_id, row.play_name)
+    .filter((e) => e.channel === "linkedin" && e.step_index === 0);
+  if (events.some((e) => e.status === "withdrawn")) {
+    return jsonResponse({ error: "invite already withdrawn" }, 409, req);
+  }
+  const sent = events.find((e) => e.status === "sent");
+  let invitationId: string | null = null;
+  let sentBy: { workspace: string; accountId: string } | null = null;
+  try {
+    const meta = JSON.parse(sent?.metadata_json ?? "{}") as {
+      invitationId?: unknown;
+      accountId?: unknown;
+      accountWorkspace?: unknown;
+    };
+    invitationId = typeof meta.invitationId === "string" ? meta.invitationId : null;
+    if (typeof meta.accountId === "string" && typeof meta.accountWorkspace === "string") {
+      sentBy = { workspace: meta.accountWorkspace, accountId: meta.accountId };
+    }
+  } catch {
+    invitationId = null;
+  }
+  if (!invitationId) {
+    return jsonResponse({ error: "no OneShot invitation id recorded for this row" }, 409, req);
+  }
+  // The account that sent the invite; invites recorded before that was
+  // stored fall back to the current outreach account.
+  const account = sentBy ?? linkedInOutreachAccount();
+  if (!account) {
+    return jsonResponse({ error: "connect LinkedIn on /setup to withdraw invites" }, 409, req);
+  }
+  try {
+    const result = (await callLinkedIn(account.workspace, {
+      kind: "withdraw",
+      accountId: account.accountId,
+      invitationId,
+      idempotencyKey: `gtm:${currentWorkspaceName()}:queue:${id}:withdraw`,
+      playName: row.play_name,
+    })) as { status?: string };
+    // not_pending: the invite was accepted or is otherwise gone — nothing
+    // was withdrawn, so nothing is recorded.
+    if (!isWithdrawnStatus(result.status)) {
+      return jsonResponse(
+        { error: `the invite is no longer pending (${result.status ?? "unknown"})` },
+        409,
+        req,
+      );
+    }
+    ledger.recordSequenceEvent({
+      prospectId: row.prospect_id,
+      playName: row.play_name,
+      stepIndex: 0,
+      channel: "linkedin",
+      status: "withdrawn",
+      metadata: { invitationId, withdrawStatus: result.status ?? null },
+    });
+    return jsonResponse({ ok: true, status: result.status ?? null }, 200, req);
+  } catch (err) {
+    return jsonResponse({ error: (err as Error).message ?? "withdraw failed" }, 502, req);
+  }
+}
+
+/**
+ * Move an unsent row to another outreach channel it has an address for. The
+ * old draft is dropped; Regenerate writes one for the new channel.
+ */
+export async function setQueueChannelRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  let body: { channel?: unknown };
+  try {
+    body = (await req.json()) as { channel?: unknown };
+  } catch {
+    return jsonResponse({ error: "body must be {channel}" }, 400, req);
+  }
+  if (!isOutreachChannel(body.channel)) {
+    return jsonResponse({ error: "channel must be email, linkedin or x" }, 400, req);
+  }
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  let payload: Record<string, unknown> = {};
+  try {
+    const p = JSON.parse(row.payload_json);
+    if (p && typeof p === "object") payload = p as Record<string, unknown>;
+  } catch {
+    // no addresses → refused below
+  }
+  if (!channelAddresses(payload).includes(body.channel)) {
+    return jsonResponse({ error: `this person has no ${body.channel} address` }, 400, req);
+  }
+  const switched = ledger.setQueueChannel(id, body.channel);
+  if (switched === "sent") return jsonResponse({ error: "row already sent" }, 409, req);
+  if (switched === "busy") {
+    return jsonResponse(
+      { error: "row is being drained or sent — try again in a few minutes" },
+      409,
+      req,
+    );
+  }
+  return jsonResponse({ ok: true, channel: body.channel }, 200, req);
 }

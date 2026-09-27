@@ -884,6 +884,8 @@ export class QueueStore {
     id: number;
     previousDraft: string | null;
     previousPayload: string;
+    /** The channel the draft was written for; a switch meanwhile refuses the save. */
+    previousChannel?: string;
     draft: Parameters<QueueStore["setQueueDraft"]>[0]["draft"];
     /** Why the draft being replaced was discarded (see ledger-drafts.ts). */
     discardReason?: DraftDiscardReason;
@@ -894,7 +896,7 @@ export class QueueStore {
         const saved =
           this.db
             .prepare(`UPDATE target_queue SET last_draft_json = ?, last_drafted_at = ?
-      WHERE id = ? AND last_draft_json IS ? AND payload_json = ?
+      WHERE id = ? AND last_draft_json IS ? AND payload_json = ? AND channel = COALESCE(?, channel)
       AND status != 'sent' AND sent_at IS NULL AND send_started_at IS NULL`)
             .run(
               JSON.stringify({ ...input.draft, draftedAt: at }),
@@ -902,6 +904,7 @@ export class QueueStore {
               input.id,
               input.previousDraft,
               input.previousPayload,
+              input.previousChannel ?? null,
             ).changes === 1;
         if (saved) {
           this.versionQueueDraft(
@@ -1030,6 +1033,47 @@ export class QueueStore {
         .run(id);
       this.drafts.close({ queueId: id }, "discarded", "redraft");
     })();
+  }
+
+  /**
+   * Move an unsent row to another outreach channel. Its draft was written for
+   * the old channel, so it is dropped (the open version closes as a redraft)
+   * and the next draft is written for the new one. False when the row is gone
+   * or already sent.
+   */
+  setQueueChannel(
+    id: number,
+    channel: OutreachChannel,
+    opts: { leaseSeconds?: number } = {},
+  ): "changed" | "sent" | "busy" {
+    // A row a send or a live drain lease holds keeps its channel: the send
+    // already read it, and switching would drop the draft it is shipping.
+    const cutoff = new Date(Date.now() - (opts.leaseSeconds ?? 900) * 1000).toISOString();
+    return this.db
+      .transaction((): "changed" | "sent" | "busy" => {
+        const current = this.db
+          .query(`SELECT channel, status, sent_at FROM target_queue WHERE id = ?`)
+          .get(id) as { channel: string; status: string; sent_at: string | null } | null;
+        if (!current || current.status === "sent" || current.sent_at) return "sent";
+        // Already on this channel: nothing to switch, and its draft stays.
+        if (current.channel === channel) return "changed";
+        const changed = this.db
+          .prepare(
+            `UPDATE target_queue SET channel = ?, last_draft_json = NULL, last_drafted_at = NULL
+             WHERE id = ? AND status != 'sent' AND sent_at IS NULL AND send_started_at IS NULL
+               AND (drain_claimed_at IS NULL OR drain_claimed_at < ?)`,
+          )
+          .run(channel, id, cutoff).changes;
+        if (changed === 0) {
+          const row = this.db
+            .query(`SELECT status, sent_at FROM target_queue WHERE id = ?`)
+            .get(id) as { status: string; sent_at: string | null } | null;
+          return !row || row.status === "sent" || row.sent_at ? "sent" : "busy";
+        }
+        this.drafts.close({ queueId: id }, "discarded", "redraft");
+        return "changed";
+      })
+      .immediate();
   }
 
   /** Slot + identity for a queue row's draft versions; null when the row is gone. */
