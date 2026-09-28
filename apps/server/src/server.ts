@@ -209,39 +209,6 @@ const routes: RouteEntry[] = [
   route("GET", "/api/doctor", doctor),
   route("GET", "/api/workspace", workspaceInfo),
   route("POST", "/api/workspace/launch", workspaceLaunch),
-  route("POST", "/api/run/:playName", runPlay),
-  // Distinct shape from the line above (three segments, not two), so the
-  // patterns can't collide however they are ordered.
-  route("POST", "/api/run/:runId/cancel", cancelRunRoute),
-  route("GET", "/api/runs/:id", getRunRoute),
-  route("POST", "/api/prospects/add", addProspectRoute),
-  route("GET", "/api/queue", listQueueRoute),
-  // Literal before param: `:id` matches [^/]+ and would otherwise swallow "search".
-  route("GET", "/api/queue/search", searchQueueRoute),
-  // Literal before param for the same reason; the destination side of a move.
-  route("POST", "/api/queue/import", importQueueRowRoute),
-  route("GET", "/api/queue/:id", queueRowDetailRoute),
-  route("GET", "/api/queue/:id/drafts", queueDraftVersionsRoute),
-  route("POST", "/api/queue/approve-all", approveAllRoute),
-  route("POST", "/api/queue/drain", drainQueueRoute),
-  route("POST", "/api/queue/:id/approve", approveQueueRoute),
-  route("POST", "/api/queue/:id/resolve-contact", resolveQueueContactRoute),
-  route("POST", "/api/queue/:id/reject", rejectQueueRoute),
-  route("POST", "/api/queue/:id/reject-reason", suggestRejectReasonRoute),
-  route("POST", "/api/queue/:id/regenerate", regenerateDraftRoute),
-  route("POST", "/api/queue/:id/send-draft", sendDraftRoute),
-  route("POST", "/api/queue/:id/mark-sent", markSentRoute),
-  route("POST", "/api/queue/:id/withdraw-invite", withdrawInviteRoute),
-  route("POST", "/api/queue/:id/channel", setQueueChannelRoute),
-  route("POST", "/api/queue/:id/move", moveQueueRowRoute),
-  route("GET", "/api/triggers", listTriggersRoute),
-  route("POST", "/api/triggers/cal-no-show", calNoShowWebhookRoute),
-  route("POST", "/api/triggers/signup", signupWebhookRoute),
-  route("POST", "/api/triggers/:name/enabled", setTriggerEnabledRoute),
-  route("POST", "/api/triggers/:name/config", setTriggerConfigRoute),
-  route("POST", "/api/triggers/:name/run", runTriggerRoute),
-  route("GET", "/api/packs", listPacksRoute),
-  route("POST", "/api/packs/:id/apply", applyPackRoute),
 ];
 
 function findRoute(req: Request): { handler: RouteHandler; params: Record<string, string> } | null {
